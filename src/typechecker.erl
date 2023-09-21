@@ -1778,6 +1778,15 @@ do_type_check_expr(Env, {match, _, Pat, Expr}) ->
     UBound = case UBoundNorm of NormTy -> Ty;
                                 _Other -> UBoundNorm end,
     {UBound, Env2, constraints:combine(Cs,Cs2)};
+do_type_check_expr(Env, {maybe_match, _, Pat, Expr}) ->
+    {Ty, VarBinds, Cs} = type_check_expr(Env, Expr),
+    NormTy = normalize(Ty, Env),
+    NewEnv = union_var_binds(VarBinds, Env, Env),
+    {[_PatTy], [UBoundNorm], Env2, Cs2} =
+            ?throw_orig_type(add_types_pats([Pat], [NormTy], NewEnv, capture_vars), Ty, NormTy),
+    UBound = case UBoundNorm of NormTy -> Ty;
+                                _Other -> UBoundNorm end,
+    {UBound, Env2, constraints:combine(Cs,Cs2)};
 do_type_check_expr(Env, {'if', _, Clauses}) ->
     infer_clauses(Env, Clauses);
 do_type_check_expr(Env, {'case', _, Expr, Clauses}) ->
@@ -2130,11 +2139,17 @@ do_type_check_expr(Env, {'try', _, Block, CaseCs, CatchCs, AfterBlock}) ->
     {normalize({type, erl_anno:new(0), union, [Ty, TyC, TyS]}, Env)
     ,VB
     ,constraints:combine([Cs1,Cs2,Cs3,Cs4])};
-
 %% Maybe - value-based error handling expression
 %% See https://www.erlang.org/eeps/eep-0049
-do_type_check_expr(_Env, {'maybe', Anno, [{maybe_match, _, _LHS, _RHS}]} = MaybeExpr) ->
-    erlang:throw({unsupported_expression, Anno, MaybeExpr}).
+do_type_check_expr(Env, {'maybe', _, Block}) ->
+    type_check_block(Env, Block);
+do_type_check_expr(Env, {'maybe', _, Block, {'else', _, ElseCs}}) ->
+    {Ty,  VB,   Cs1} = type_check_block(Env, Block),
+    Env2 = add_var_binds(VB, Env, Env),
+    {TyE, _VB2, Cs2} = infer_clauses(Env2, ElseCs),
+    {normalize({type, erl_anno:new(0), union, [Ty, TyE]}, Env)
+    ,VB
+    ,constraints:combine([Cs1,Cs2])}.
 
 %% Helper for type_check_expr for funs
 -spec type_check_fun(env(), _) -> {type(), env(), constraints:t()}.
@@ -2531,6 +2546,18 @@ type_check_comprehension(Env, Compr, Expr, [{b_generate, _P, Pat, Gen} | Quals])
         type_check_expr_in(Env, BitStringTy, Gen),
     {_PatTys, _UBounds, NewEnv, Cs2} =
         add_types_pats([Pat], [BitStringTy], Env, capture_vars),
+    {TyL, VarBinds2, Cs3} =
+        type_check_comprehension(NewEnv, Compr, Expr, Quals),
+    {TyL
+    ,union_var_binds(VarBinds1, VarBinds2, Env)
+    ,constraints:combine([Cs1, Cs2, Cs3])};
+
+type_check_comprehension(Env, Compr, Expr, [{m_generate, _P, Pat, Gen} | Quals]) ->
+    MapTy = type(map, []),
+    {VarBinds1, Cs1} =
+        type_check_expr_in(Env, MapTy, Gen),
+    {_PatTys, _UBounds, NewEnv, Cs2} =
+        add_types_pats([Pat], [MapTy], Env, capture_vars),
     {TyL, VarBinds2, Cs3} =
         type_check_comprehension(NewEnv, Compr, Expr, Quals),
     {TyL
@@ -3364,6 +3391,7 @@ unary_op_arg_type(_Op, {var, _, _}) ->
        when
         ListGen :: {generate, erl_anno:anno(), gradualizer_type:abstract_expr(), gradualizer_type:abstract_expr()},
         BinGen  :: {b_generate, erl_anno:anno(), gradualizer_type:abstract_expr(), gradualizer_type:abstract_expr()},
+        BinGen  :: {m_generate, erl_anno:anno(), gradualizer_type:abstract_expr(), gradualizer_type:abstract_expr()},
         Filter  :: gradualizer_type:abstract_expr().
 type_check_comprehension_in(Env, ResTy, OrigExpr, lc, Expr, _P, []) ->
     case expect_list_type(ResTy, allow_nil_type, Env) of
@@ -3448,6 +3476,19 @@ type_check_comprehension_in(Env, ResTy, OrigExpr, Compr, Expr, P,
         add_types_pats([Pat], [BitTy], Env, capture_vars),
     {VarBinds, Cs3} = type_check_comprehension_in(NewEnv, ResTy, OrigExpr, Compr, Expr, P, Quals),
     {VarBinds, constraints:combine([Cs1, Cs2, Cs3])};
+
+type_check_comprehension_in(Env, ResTy, OrigExpr, Compr, Expr, P,
+                            [{m_generate, _P_Gen, Pat, Gen} | Quals]) ->
+    %% map generator: Pat <- Gen
+    %% Gen and Pat should be bitstrings (of any size).
+    MapTy = {type, erl_anno:new(0), map, []},
+    {_VarBindsGen, Cs1} = type_check_expr_in(Env, MapTy, Gen),
+    {_PatTys, _UBounds, NewEnv, Cs2} =
+        add_types_pats([Pat], [MapTy], Env, capture_vars),
+    {VarBinds, Cs3} = type_check_comprehension_in(NewEnv, ResTy, OrigExpr, Compr, Expr, P, Quals),
+    {VarBinds, constraints:combine([Cs1, Cs2, Cs3])};
+
+
 type_check_comprehension_in(Env, ResTy, OrigExpr, Compr, Expr, P, [Pred | Quals]) ->
     %% We choose to check the type of the predicate here. Arguments can be
     %% made either way on whether we should check the type here.
@@ -5908,7 +5949,7 @@ create_env(#parsedata{module    = Module
          solve_constraints = proplists:get_bool(solve_constraints, Opts)}.
 
 -spec default_union_size_limit() -> non_neg_integer().
-default_union_size_limit() -> 30.
+default_union_size_limit() -> 1000.
 
 -spec create_fenv(list(), list()) -> map().
 create_fenv(Specs, Funs) ->
